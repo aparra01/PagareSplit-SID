@@ -1,0 +1,30 @@
+# PagareSplit-SID — separacion de PDF masivo por barcode (flujo sucursales / PyVision).
+FROM python:3.12-windowsservercore-ltsc2022
+
+SHELL ["powershell", "-NoProfile", "-Command"]
+RUN $ErrorActionPreference = 'Stop'; \
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
+    $vc = Join-Path $env:TEMP 'vc_redist.x64.exe'; \
+    Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.x64.exe' -OutFile $vc; \
+    $p = Start-Process -FilePath $vc -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru; \
+    if ($p.ExitCode -notin 0,3010,1638) { throw "vc_redist exit $($p.ExitCode)" }; \
+    Remove-Item $vc -Force -ErrorAction SilentlyContinue
+
+WORKDIR C:\\app
+
+ENV PAGARE_SPLIT_HOST=0.0.0.0
+ENV PAGARE_SPLIT_PORT=8006
+
+COPY requirements.txt .
+RUN python -m pip install --no-cache-dir --upgrade pip; \
+    $r = Get-Content requirements.txt; \
+    $r = $r -replace 'numpy==2\.2\.6', 'numpy==1.26.4'; \
+    $r | Set-Content requirements.windows.txt; \
+    python -m pip install --no-cache-dir -r requirements.windows.txt; \
+    python -m pip install --no-cache-dir zxing-cpp
+
+COPY app ./app
+COPY main.py .
+
+EXPOSE 8006
+CMD ["python", "main.py"]
