@@ -145,7 +145,7 @@ def _detectar_qr_en_pagina(page: fitz.Page) -> str | None:
             image,
             try_rotate=tier_idx >= 2,
             try_downscale=tier_idx >= 1,
-            try_invert=False,
+            try_invert=tier_idx >= 1,
         )
         if raw:
             return _limpiar_texto_qr(raw)

@@ -182,6 +182,35 @@ def _remapear_pagares_a_original(pagares: list[dict[str, Any]], pages_1based: li
     return remapped
 
 
+def _excluir_paginas_qr_de_pagares(
+    pagares: list[dict[str, Any]],
+    paginas_qr: list[int],
+) -> list[dict[str, Any]]:
+    """Garantiza que las hojas marcadora QR no aparezcan en los rangos de salida."""
+    qr_set = {int(p) for p in paginas_qr if p is not None}
+    qr_set = {p for p in qr_set if p >= 1}
+    if not qr_set:
+        return pagares
+
+    limpios: list[dict[str, Any]] = []
+    for item in pagares:
+        paginas = [p for p in item.get("paginas", []) if int(p) not in qr_set]
+        if not paginas:
+            continue
+        limpios.append(
+            {
+                **item,
+                "pagina_inicio": paginas[0],
+                "pagina_fin": paginas[-1],
+                "paginas": paginas,
+                "n_hojas": len(paginas),
+            }
+        )
+    for i, pagare in enumerate(limpios, start=1):
+        pagare["indice"] = i
+    return limpios
+
+
 def _detectar_pagares_actual_por_barcode_core(
     *,
     pdf_path: Path | None = None,
@@ -396,6 +425,8 @@ def detectar_pagares_actual_por_barcode(
 
         for i, pagare in enumerate(pagares, start=1):
             pagare["indice"] = i
+
+        pagares = _excluir_paginas_qr_de_pagares(pagares, paginas_qr)
 
         modo = "+".join(dict.fromkeys(modo_partes))
         return {
