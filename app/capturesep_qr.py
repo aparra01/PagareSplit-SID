@@ -10,11 +10,14 @@ from PIL import Image
 
 CAPTURESEP_PREFIX = "CAPTURESEP"
 
+# Páginas de pagaré suelen superar este umbral; no llevan QR marcadora CAPTURESEP.
+_MAX_TEXTO_PAGINA_SIN_QR = 480
+
 # Escaneo por niveles: la hoja separadora tiene el QR centrado (Formas / módulo Separadores).
 _QR_SCAN_TIERS: tuple[tuple[float, float], ...] = (
-    (1.25, 0.50),  # ~2 ms/pág: recorte central, suficiente para hojas marcadora
+    (1.25, 0.50),  # ~5 ms/pág: recorte central, suficiente para hojas marcadora
     (1.75, 0.65),  # respaldo si el QR quedó más abajo por título largo
-    (2.00, 1.00),  # último recurso: página completa sin rotaciones costosas
+    (2.00, 1.00),  # último recurso: página completa (solo hojas marcadora probables)
 )
 
 
@@ -121,18 +124,109 @@ def _render_pagina_rgb(page: fitz.Page, scale: float) -> Image.Image:
     return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
 
-def _debe_reintentar_qr_en_pagina(page: fitz.Page) -> bool:
-    """Evita escaneos costosos en páginas de pagaré o en blanco sin marcadora."""
-    if page.get_images(full=True):
+def _texto_pagina(page: fitz.Page) -> str:
+    return page.get_text("text").strip()
+
+
+def _es_raw_capturesep(raw: str) -> bool:
+    text = (raw or "").strip()
+    if not text:
+        return False
+    if text.upper().startswith(CAPTURESEP_PREFIX):
         return True
-    text_len = len(page.get_text("text").strip())
-    return 0 < text_len < 400
+    if text.startswith("{"):
+        return decode_capturesep_payload(text) is not None
+    return decode_capturesep_payload(text) is not None
 
 
-def _detectar_qr_en_pagina(page: fitz.Page) -> str | None:
-    """Busca CAPTURESEP: recorte central rápido; profundo solo en hojas marcadora."""
+def _parece_hoja_marcadora_qr(page: fitz.Page, text: str | None = None) -> bool:
+    """Heurística para no gastar tiers costosos en portadas de pagaré con logos."""
+    text = text if text is not None else _texto_pagina(page)
+    text_len = len(text)
+    if text_len >= _MAX_TEXTO_PAGINA_SIN_QR:
+        return False
+    upper = text.upper()
+    if "CAPTURESEP" in upper or "SEPARADOR" in upper or "INSERTAR ENTRE" in upper:
+        return True
+    images = page.get_images(full=True)
+    if not images:
+        return 0 < text_len < 220
+    if text_len <= 120:
+        return True
+    for img in images:
+        width = int(img[2] or 0)
+        height = int(img[3] or 0)
+        if width < 80 or height < 80:
+            continue
+        ratio = width / max(height, 1)
+        if 0.75 <= ratio <= 1.33 and min(width, height) >= 180:
+            return True
+    return text_len < 180
+
+
+def _qr_desde_imagenes_embebidas(doc: fitz.Document, page: fitz.Page) -> str | None:
+    """Lee el QR desde la imagen embebida (hoja separadora generada por CaptureSoft)."""
+    images = page.get_images(full=True)
+    if not images:
+        return None
+
+    ranked: list[tuple[int, int]] = []
+    for img in images:
+        xref = int(img[0])
+        width = int(img[2] or 0)
+        height = int(img[3] or 0)
+        if width < 64 or height < 64:
+            continue
+        ranked.append((width * height, xref))
+    ranked.sort(reverse=True)
+
+    for _, xref in ranked[:4]:
+        try:
+            pix = fitz.Pixmap(doc, xref)
+            if pix.n - pix.alpha >= 4:
+                pix = fitz.Pixmap(fitz.csRGB, pix)
+            pil = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        except Exception:
+            continue
+
+        side = max(pil.size)
+        if side > 640:
+            ratio = 640 / side
+            pil = pil.resize(
+                (max(32, int(pil.width * ratio)), max(32, int(pil.height * ratio))),
+                Image.Resampling.BILINEAR,
+            )
+
+        for try_rotate, try_downscale, try_invert in (
+            (False, False, False),
+            (True, True, True),
+        ):
+            raw = _leer_qr_zxing(
+                pil,
+                try_rotate=try_rotate,
+                try_downscale=try_downscale,
+                try_invert=try_invert,
+            )
+            if raw and _es_raw_capturesep(raw):
+                return _limpiar_texto_qr(raw)
+    return None
+
+
+def _detectar_qr_en_pagina(page: fitz.Page, doc: fitz.Document | None = None) -> str | None:
+    """Busca CAPTURESEP: imagen embebida → recorte central → tiers profundos solo en marcadora."""
+    text = _texto_pagina(page)
+    if len(text) >= _MAX_TEXTO_PAGINA_SIN_QR:
+        return None
+
+    probable_marcadora = _parece_hoja_marcadora_qr(page, text)
+
+    if doc is not None and probable_marcadora:
+        raw = _qr_desde_imagenes_embebidas(doc, page)
+        if raw:
+            return raw
+
     for tier_idx, (scale, center_frac) in enumerate(_QR_SCAN_TIERS):
-        if tier_idx > 0 and not _debe_reintentar_qr_en_pagina(page):
+        if tier_idx > 0 and not probable_marcadora:
             break
         try:
             image = _render_pagina_rgb(page, scale)
@@ -147,7 +241,7 @@ def _detectar_qr_en_pagina(page: fitz.Page) -> str | None:
             try_downscale=tier_idx >= 1,
             try_invert=tier_idx >= 1,
         )
-        if raw:
+        if raw and _es_raw_capturesep(raw):
             return _limpiar_texto_qr(raw)
     return None
 
@@ -166,7 +260,10 @@ def detectar_marcadores_qr_capturesep(
         cap = min(len(doc), max(1, max_pages))
         for idx in range(cap):
             page_num = idx + 1
-            raw = _detectar_qr_en_pagina(doc.load_page(idx))
+            page = doc.load_page(idx)
+            if len(_texto_pagina(page)) >= _MAX_TEXTO_PAGINA_SIN_QR:
+                continue
+            raw = _detectar_qr_en_pagina(page, doc)
             if not raw:
                 continue
             payload = decode_capturesep_payload(raw)
