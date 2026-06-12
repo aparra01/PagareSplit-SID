@@ -16,6 +16,8 @@ Microservicio dedicado para separar lotes PDF de pagarés sin ejecutar OCR ni mo
 - `file`: PDF.
 - `dpi`: opcional, por defecto `120`.
 - `solo_rangos`: opcional, `true` para separar rápido por rangos sin leer barcodes.
+- `separar_qr`: opcional, `true` para detectar hojas marcadora **CAPTURESEP** (v1 pagarés o v2 módulo Separadores).
+- `separar_barcode`: opcional, `true` por defecto. Con `separar_qr=true`, primero parte por QR y luego aplica barcode/layout en cada tramo.
 
 Respuesta principal:
 
@@ -23,12 +25,27 @@ Respuesta principal:
 {
   "total_paginas": 17,
   "total_pagares": 3,
-  "modo": "layout_portada_barcode_code39",
+  "modo": "capturesep_qr+layout_portada_barcode_code39",
+  "paginas_qr": [3, 10],
+  "marcadores_qr": [
+    { "pagina_1_based": 3, "raw": "CAPTURESEP|1|Pagarés Formato Actual|SEPARADOR_PAGARE", "payload": { "cliente": "...", "separador": "SEPARADOR_PAGARE", "version": 1 } }
+  ],
   "pagares": [
-    { "indice": 1, "pagina_inicio": 1, "pagina_fin": 7, "codigo_operacion": "0312212000", "paginas": [1, 2, 3, 4, 5, 6, 7], "n_hojas": 7 }
+    { "indice": 1, "pagina_inicio": 1, "pagina_fin": 2, "codigo_operacion": "0312212000", "paginas": [1, 2], "n_hojas": 2 }
   ]
 }
 ```
+
+### Hojas QR soportadas
+
+| Origen | Payload ejemplo | Uso |
+|--------|-----------------|-----|
+| Formas → Descargar hoja separador QR | `CAPTURESEP\|1\|Cliente\|SEPARADOR_PAGARE` | Partir lote de pagarés al escanear |
+| Configuraciones → Separadores → QR | `CAPTURESEP\|2\|Cliente\|87` | Partir por tipo/carpeta (id en BD) |
+
+Imprima la hoja e insértela **entre** documentos antes de escanear. PagareSplit excluye la página QR del contenido y genera un documento por tramo.
+
+**Rendimiento:** el escaneo QR usa recorte central (~2 ms/página de pagaré). Solo reintenta con más detalle en páginas que parecen hoja marcadora (imagen embebida o poco texto). Un PDF que es **solo** la hoja QR devuelve `modo: capturesep_qr_solo_marcadores` al instante, sin pasar por barcode.
 
 ## Arranque Local
 
@@ -65,7 +82,8 @@ $pdf = "C:\RUTA\A\TU\ARCHIVO.pdf"
 curl.exe -X POST "http://127.0.0.1:8006/detectar-pagares-actual" `
   -F "file=@$pdf;type=application/pdf" `
   -F "dpi=120" `
-  -F "solo_rangos=true"
+  -F "solo_rangos=true" `
+  -F "separar_qr=true"
 ```
 
 ### CMD

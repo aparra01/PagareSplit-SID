@@ -1,4 +1,4 @@
-"""Detección liviana de pagarés formato actual por layout + Code39."""
+"""Detección liviana de pagarés formato actual por layout + Code39 + QR CAPTURESEP."""
 
 from __future__ import annotations
 
@@ -11,6 +11,11 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from app.barcode_pdf import barcodes_pdf_en_memoria
+from app.capturesep_qr import (
+    detectar_marcadores_qr_capturesep,
+    pdf_solo_hojas_qr,
+    segmentos_entre_paginas_qr,
+)
 
 BARCODE_SCAN_DPI_FALLBACKS = (160, 200)
 LAYOUT_START_SIM_THRESHOLD = 0.45
@@ -142,7 +147,42 @@ def _codigos_unicos(barcodes: list[dict[str, Any]]) -> list[str]:
     return codigos
 
 
-def detectar_pagares_actual_por_barcode(
+def _extraer_paginas_pdf(pdf_bytes: bytes, pages_1based: list[int]) -> bytes:
+    if not pages_1based:
+        return pdf_bytes
+    src = fitz.open(stream=pdf_bytes, filetype="pdf")
+    dst = fitz.open()
+    try:
+        for page_num in pages_1based:
+            idx = page_num - 1
+            if 0 <= idx < len(src):
+                dst.insert_pdf(src, from_page=idx, to_page=idx)
+        return dst.tobytes()
+    finally:
+        src.close()
+        dst.close()
+
+
+def _remapear_pagares_a_original(pagares: list[dict[str, Any]], pages_1based: list[int]) -> list[dict[str, Any]]:
+    page_map = {subset_idx + 1: orig for subset_idx, orig in enumerate(pages_1based)}
+    remapped: list[dict[str, Any]] = []
+    for item in pagares:
+        paginas_orig = [page_map[p] for p in item.get("paginas", []) if p in page_map]
+        if not paginas_orig:
+            continue
+        remapped.append(
+            {
+                **item,
+                "pagina_inicio": paginas_orig[0],
+                "pagina_fin": paginas_orig[-1],
+                "paginas": paginas_orig,
+                "n_hojas": len(paginas_orig),
+            }
+        )
+    return remapped
+
+
+def _detectar_pagares_actual_por_barcode_core(
     *,
     pdf_path: Path | None = None,
     pdf_bytes: bytes | None = None,
@@ -252,3 +292,129 @@ def detectar_pagares_actual_por_barcode(
             for idx, items in enumerate(por_pagina, start=1)
         ],
     }
+
+
+def detectar_pagares_actual_por_barcode(
+    *,
+    pdf_path: Path | None = None,
+    pdf_bytes: bytes | None = None,
+    dpi: int = 160,
+    solo_rangos: bool = False,
+    separar_qr: bool = False,
+    separar_barcode: bool = True,
+) -> dict[str, Any]:
+    if pdf_bytes is None and pdf_path is not None:
+        pdf_bytes = pdf_path.read_bytes()
+    if pdf_bytes is None:
+        return {
+            "total_paginas": 0,
+            "total_pagares": 0,
+            "pagares": [],
+            "modo": "sin_pdf",
+        }
+
+    marcadores_qr: list[dict[str, Any]] = []
+    if separar_qr:
+        marcadores_qr = detectar_marcadores_qr_capturesep(pdf_bytes=pdf_bytes)
+
+    if separar_qr and not marcadores_qr and not separar_barcode:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total_pages = len(doc)
+        doc.close()
+        paginas = list(range(1, total_pages + 1)) if total_pages > 0 else []
+        pagares = []
+        if paginas:
+            pagares = [
+                {
+                    "indice": 1,
+                    "pagina_inicio": 1,
+                    "pagina_fin": total_pages,
+                    "codigo_operacion": None,
+                    "paginas": paginas,
+                    "n_hojas": len(paginas),
+                }
+            ]
+        return {
+            "total_paginas": total_pages,
+            "total_pagares": len(pagares),
+            "pagares": pagares,
+            "modo": "capturesep_qr_sin_marcadores",
+            "dpi_usado": dpi,
+            "marcadores_qr": [],
+            "paginas_qr": [],
+        }
+
+    if marcadores_qr:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total_pages = len(doc)
+        doc.close()
+        paginas_qr = [int(m["pagina_1_based"]) for m in marcadores_qr]
+
+        if pdf_solo_hojas_qr(total_pages, paginas_qr):
+            return {
+                "total_paginas": total_pages,
+                "total_pagares": 0,
+                "pagares": [],
+                "modo": "capturesep_qr_solo_marcadores",
+                "dpi_usado": dpi,
+                "marcadores_qr": marcadores_qr,
+                "paginas_qr": paginas_qr,
+            }
+
+        segmentos = segmentos_entre_paginas_qr(total_pages, paginas_qr)
+
+        pagares: list[dict[str, Any]] = []
+        modo_partes: list[str] = ["capturesep_qr"]
+
+        for segmento in segmentos:
+            if not segmento:
+                continue
+            if separar_barcode:
+                subset_bytes = _extraer_paginas_pdf(pdf_bytes, segmento)
+                sub = _detectar_pagares_actual_por_barcode_core(
+                    pdf_bytes=subset_bytes,
+                    dpi=dpi,
+                    solo_rangos=solo_rangos,
+                )
+                sub_pagares = _remapear_pagares_a_original(sub.get("pagares", []), segmento)
+                if sub_pagares:
+                    pagares.extend(sub_pagares)
+                    if sub.get("modo"):
+                        modo_partes.append(str(sub["modo"]))
+                    continue
+
+            pagares.append(
+                {
+                    "indice": 0,
+                    "pagina_inicio": segmento[0],
+                    "pagina_fin": segmento[-1],
+                    "codigo_operacion": None,
+                    "paginas": segmento,
+                    "n_hojas": len(segmento),
+                }
+            )
+
+        for i, pagare in enumerate(pagares, start=1):
+            pagare["indice"] = i
+
+        modo = "+".join(dict.fromkeys(modo_partes))
+        return {
+            "total_paginas": total_pages,
+            "total_pagares": len(pagares),
+            "pagares": pagares,
+            "modo": modo,
+            "dpi_usado": dpi,
+            "marcadores_qr": marcadores_qr,
+            "paginas_qr": paginas_qr,
+        }
+
+    result = _detectar_pagares_actual_por_barcode_core(
+        pdf_path=pdf_path,
+        pdf_bytes=pdf_bytes,
+        dpi=dpi,
+        solo_rangos=solo_rangos,
+    )
+    if separar_qr:
+        result["marcadores_qr"] = []
+        result["paginas_qr"] = []
+    return result

@@ -22,6 +22,8 @@ async def detectar_pagares_actual(
     file: UploadFile = File(...),
     dpi: int = Form(default=160),
     solo_rangos: bool = Form(default=False),
+    separar_qr: bool = Form(default=False),
+    separar_barcode: bool = Form(default=True),
 ):
     settings = get_settings()
     if not file.filename or not file.filename.lower().endswith(".pdf"):
@@ -36,4 +38,10 @@ async def detectar_pagares_actual(
         raise HTTPException(413, f"PDF demasiado grande para separación ({settings.max_pdf_mb} MB máximo)")
 
     safe_dpi = max(72, min(int(dpi or settings.default_dpi), 300))
-    return detectar_pagares_actual_por_barcode(pdf_bytes=pdf_bytes, dpi=safe_dpi, solo_rangos=solo_rangos)
+    return detectar_pagares_actual_por_barcode(
+        pdf_bytes=pdf_bytes,
+        dpi=safe_dpi,
+        solo_rangos=solo_rangos,
+        separar_qr=separar_qr,
+        separar_barcode=separar_barcode,
+    )
