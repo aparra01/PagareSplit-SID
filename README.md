@@ -10,6 +10,7 @@ Microservicio dedicado para separar lotes PDF de pagarés sin ejecutar OCR ni mo
 
 - `GET /health`
 - `POST /detectar-pagares-actual`
+- `POST /normalizar-pdf` — preprocesa escaneos (quita blancos, orientación 90°/180°/270°, deskew fino)
 
 `POST /detectar-pagares-actual` recibe multipart:
 
@@ -18,6 +19,40 @@ Microservicio dedicado para separar lotes PDF de pagarés sin ejecutar OCR ni mo
 - `solo_rangos`: opcional, `true` para separar rápido por rangos sin leer barcodes.
 - `separar_qr`: opcional, `true` para detectar hojas marcadora **CAPTURESEP** (v1 pagarés o v2 módulo Separadores).
 - `separar_barcode`: opcional, `true` por defecto. Con `separar_qr=true`, primero parte por QR y luego aplica barcode/layout en cada tramo.
+- `eliminar_blancos`: opcional, por defecto `true` (env `PAGARE_SPLIT_ELIMINAR_BLANCOS`).
+- `corregir_orientacion`: opcional, por defecto `true` — corrige hojas mal puestas en el escáner (OpenCV + heurísticas pagaré).
+- `aplicar_deskew`: opcional, por defecto `true` — inclinación fina (~1°–15°).
+- `aplicar_mejora_imagen`: opcional, por defecto `true` — mejora tipo PaperStream (fondo, crop, ruido, énfasis).
+- `incluir_pdf_normalizado`: opcional, `false`. Si `true`, respuesta `multipart/mixed` con JSON + PDF normalizado.
+
+`POST /normalizar-pdf` acepta los mismos flags de preproceso y devuelve solo el PDF corregido.
+
+### Preproceso de escaneo (WIA / ADF)
+
+Antes de layout y barcode, el servicio puede:
+
+1. Descartar páginas en blanco (separadores).
+2. Enderezar orientación gruesa (90° / 180° / 270°) con OpenCV y reglas de portada pagaré.
+3. Aplicar deskew fino.
+4. **Mejora de imagen** (réplica software de PaperStream IP): blanqueo de fondo, despeckle, rayas verticales, auto-crop, énfasis de texto.
+
+La respuesta de detección puede incluir `paginas_blancas_excluidas` y `transformaciones` por página. Los rangos `pagares[].paginas` referencian el PDF **original** (sin índices de hojas blancas).
+
+### Mejora nativa PaperStream vs réplica PagareSplit
+
+| PaperStream IP (fi-7160 TWAIN) | PagareSplit (`scan_enhance.py`) |
+|-------------------------------|----------------------------------|
+| Auto rotation / deskew / crop | `scan_orientation.py` + `auto_crop_content` |
+| Blank page skip | `is_blank_page_rgb` |
+| Background cleanup / BGAdjust | `whiten_background` |
+| Vertical streaks reduction | `reduce_vertical_streaks` |
+| Image emphasis / OCR tuning | `emphasize_document` |
+| iDTC binarización adaptativa | No (se mantiene color para barcode); opcional futuro |
+| Punch hole / tab crop | No implementado |
+
+**Nota:** con WIA el driver aplica menos procesamiento que con PaperStream TWAIN. PagareSplit compensa en post-proceso del PDF.
+
+Variables en `.env` (prefijo `PAGARE_SPLIT_`): `ELIMINAR_BLANCOS`, `CORREGIR_ORIENTACION`, `APLICAR_DESKEW`, `PREPROCESS_DPI`, `BLANK_MEAN_THRESHOLD`, etc. Ver `.env.example`.
 
 Respuesta principal:
 

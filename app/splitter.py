@@ -11,6 +11,9 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from app.barcode_pdf import barcodes_pdf_en_memoria
+from app.config import Settings, get_settings
+from app.pdf_preprocess import PreprocessResult, normalizar_pdf
+from app.scan_orientation import BlankDocumentError
 from app.capturesep_qr import (
     detectar_marcadores_qr_capturesep,
     pdf_solo_hojas_qr,
@@ -211,6 +214,145 @@ def _excluir_paginas_qr_de_pagares(
     return limpios
 
 
+def _excluir_paginas_de_pagares(
+    pagares: list[dict[str, Any]],
+    paginas_excluir: list[int],
+) -> list[dict[str, Any]]:
+    excluir = {int(p) for p in paginas_excluir if p is not None and int(p) >= 1}
+    if not excluir:
+        return pagares
+
+    limpios: list[dict[str, Any]] = []
+    for item in pagares:
+        paginas = [p for p in item.get("paginas", []) if int(p) not in excluir]
+        if not paginas:
+            continue
+        limpios.append(
+            {
+                **item,
+                "pagina_inicio": paginas[0],
+                "pagina_fin": paginas[-1],
+                "paginas": paginas,
+                "n_hojas": len(paginas),
+            }
+        )
+    for i, pagare in enumerate(limpios, start=1):
+        pagare["indice"] = i
+    return limpios
+
+
+def _remapear_pagares_normalizado_a_original(
+    pagares: list[dict[str, Any]],
+    kept_original_pages: list[int],
+) -> list[dict[str, Any]]:
+    remapped: list[dict[str, Any]] = []
+    for item in pagares:
+        paginas_orig: list[int] = []
+        for p in item.get("paginas", []):
+            idx = int(p) - 1
+            if 0 <= idx < len(kept_original_pages):
+                paginas_orig.append(kept_original_pages[idx])
+        if not paginas_orig:
+            continue
+        remapped.append(
+            {
+                **item,
+                "pagina_inicio": paginas_orig[0],
+                "pagina_fin": paginas_orig[-1],
+                "paginas": paginas_orig,
+                "n_hojas": len(paginas_orig),
+            }
+        )
+    for i, pagare in enumerate(remapped, start=1):
+        pagare["indice"] = i
+    return remapped
+
+
+def _preprocess_metadata_dict(preprocess: PreprocessResult | None) -> dict[str, Any]:
+    if preprocess is None:
+        return {}
+    return {
+        "paginas_blancas_excluidas": preprocess.blank_pages_original,
+        "total_paginas_blancas": len(preprocess.blank_pages_original),
+        "transformaciones": [
+            {
+                "pagina": t.pagina_original,
+                "grueso_grados": t.coarse_grados,
+                "deskew_grados": round(t.deskew_grados, 2),
+                "descartada": t.descartada,
+            }
+            for t in preprocess.transforms
+        ],
+        "pdf_normalizado_disponible": True,
+    }
+
+
+def _maybe_preprocess(
+    pdf_bytes: bytes,
+    *,
+    settings: Settings | None,
+    eliminar_blancos: bool | None,
+    corregir_orientacion: bool | None,
+    aplicar_deskew: bool | None,
+    aplicar_mejora_imagen: bool | None,
+) -> tuple[bytes, PreprocessResult | None]:
+    cfg = settings or get_settings()
+    enabled = (
+        (eliminar_blancos if eliminar_blancos is not None else cfg.eliminar_blancos)
+        or (corregir_orientacion if corregir_orientacion is not None else cfg.corregir_orientacion)
+        or (aplicar_deskew if aplicar_deskew is not None else cfg.aplicar_deskew)
+        or (aplicar_mejora_imagen if aplicar_mejora_imagen is not None else cfg.aplicar_mejora_imagen)
+    )
+    if not enabled:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            n = len(doc)
+        finally:
+            doc.close()
+        return pdf_bytes, None
+
+    preprocess = normalizar_pdf(
+        pdf_bytes,
+        settings=cfg,
+        eliminar_blancos=eliminar_blancos,
+        corregir_orientacion=corregir_orientacion,
+        aplicar_deskew=aplicar_deskew,
+        aplicar_mejora_imagen=aplicar_mejora_imagen,
+    )
+    return preprocess.pdf_bytes, preprocess
+
+
+def _apply_preprocess_to_result(
+    result: dict[str, Any],
+    preprocess: PreprocessResult | None,
+) -> dict[str, Any]:
+    if preprocess is None:
+        return result
+    result = dict(result)
+    result["pagares"] = _remapear_pagares_normalizado_a_original(
+        result.get("pagares", []),
+        preprocess.kept_original_pages,
+    )
+    result["total_pagares"] = len(result["pagares"])
+    result.update(_preprocess_metadata_dict(preprocess))
+    return result
+
+
+def _segmento_en_pdf_normalizado(
+    segmento_original: list[int],
+    preprocess: PreprocessResult,
+) -> tuple[list[int], list[int]]:
+    """Devuelve páginas 1-based en PDF normalizado y las originales conservadas en orden."""
+    orig_to_norm = preprocess.original_to_normalized
+    norm_pages: list[int] = []
+    orig_kept: list[int] = []
+    for p in segmento_original:
+        if p in orig_to_norm:
+            norm_pages.append(orig_to_norm[p])
+            orig_kept.append(p)
+    return norm_pages, orig_kept
+
+
 def _detectar_pagares_actual_por_barcode_core(
     *,
     pdf_path: Path | None = None,
@@ -331,6 +473,11 @@ def detectar_pagares_actual_por_barcode(
     solo_rangos: bool = False,
     separar_qr: bool = False,
     separar_barcode: bool = True,
+    eliminar_blancos: bool | None = None,
+    corregir_orientacion: bool | None = None,
+    aplicar_deskew: bool | None = None,
+    aplicar_mejora_imagen: bool | None = None,
+    settings: Settings | None = None,
 ) -> dict[str, Any]:
     if pdf_bytes is None and pdf_path is not None:
         pdf_bytes = pdf_path.read_bytes()
@@ -342,28 +489,50 @@ def detectar_pagares_actual_por_barcode(
             "modo": "sin_pdf",
         }
 
+    original_pdf_bytes = pdf_bytes
+    try:
+        pdf_bytes_work, preprocess = _maybe_preprocess(
+            pdf_bytes,
+            settings=settings,
+            eliminar_blancos=eliminar_blancos,
+            corregir_orientacion=corregir_orientacion,
+            aplicar_deskew=aplicar_deskew,
+            aplicar_mejora_imagen=aplicar_mejora_imagen,
+        )
+    except BlankDocumentError as exc:
+        return {
+            "total_paginas": 0,
+            "total_pagares": 0,
+            "pagares": [],
+            "modo": "blank_document",
+            "error": str(exc),
+            **_preprocess_metadata_dict(None),
+        }
+
     marcadores_qr: list[dict[str, Any]] = []
     if separar_qr:
-        marcadores_qr = detectar_marcadores_qr_capturesep(pdf_bytes=pdf_bytes)
+        marcadores_qr = detectar_marcadores_qr_capturesep(pdf_bytes=original_pdf_bytes)
 
     if separar_qr and not marcadores_qr and not separar_barcode:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        doc = fitz.open(stream=original_pdf_bytes, filetype="pdf")
         total_pages = len(doc)
         doc.close()
         paginas = list(range(1, total_pages + 1)) if total_pages > 0 else []
+        if preprocess is not None:
+            paginas = [p for p in paginas if p not in set(preprocess.blank_pages_original)]
         pagares = []
         if paginas:
             pagares = [
                 {
                     "indice": 1,
-                    "pagina_inicio": 1,
-                    "pagina_fin": total_pages,
+                    "pagina_inicio": paginas[0],
+                    "pagina_fin": paginas[-1],
                     "codigo_operacion": None,
                     "paginas": paginas,
                     "n_hojas": len(paginas),
                 }
             ]
-        return {
+        result = {
             "total_paginas": total_pages,
             "total_pagares": len(pagares),
             "pagares": pagares,
@@ -372,9 +541,12 @@ def detectar_pagares_actual_por_barcode(
             "marcadores_qr": [],
             "paginas_qr": [],
         }
+        if preprocess is not None:
+            result.update(_preprocess_metadata_dict(preprocess))
+        return result
 
     if marcadores_qr:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        doc = fitz.open(stream=original_pdf_bytes, filetype="pdf")
         total_pages = len(doc)
         doc.close()
         paginas_qr = [int(m["pagina_1_based"]) for m in marcadores_qr]
@@ -399,27 +571,45 @@ def detectar_pagares_actual_por_barcode(
             if not segmento:
                 continue
             if separar_barcode:
-                subset_bytes = _extraer_paginas_pdf(pdf_bytes, segmento)
-                sub = _detectar_pagares_actual_por_barcode_core(
-                    pdf_bytes=subset_bytes,
-                    dpi=dpi,
-                    solo_rangos=solo_rangos,
-                )
-                sub_pagares = _remapear_pagares_a_original(sub.get("pagares", []), segmento)
+                if preprocess is not None:
+                    norm_pages, orig_kept = _segmento_en_pdf_normalizado(segmento, preprocess)
+                    if not norm_pages:
+                        continue
+                    subset_bytes = _extraer_paginas_pdf(pdf_bytes_work, norm_pages)
+                    sub = _detectar_pagares_actual_por_barcode_core(
+                        pdf_bytes=subset_bytes,
+                        dpi=dpi,
+                        solo_rangos=solo_rangos,
+                    )
+                    sub_pagares = _remapear_pagares_a_original(sub.get("pagares", []), orig_kept)
+                else:
+                    subset_bytes = _extraer_paginas_pdf(original_pdf_bytes, segmento)
+                    sub = _detectar_pagares_actual_por_barcode_core(
+                        pdf_bytes=subset_bytes,
+                        dpi=dpi,
+                        solo_rangos=solo_rangos,
+                    )
+                    sub_pagares = _remapear_pagares_a_original(sub.get("pagares", []), segmento)
                 if sub_pagares:
                     pagares.extend(sub_pagares)
                     if sub.get("modo"):
                         modo_partes.append(str(sub["modo"]))
                     continue
 
+            segmento_limpio = segmento
+            if preprocess is not None:
+                blank_set = set(preprocess.blank_pages_original)
+                segmento_limpio = [p for p in segmento if p not in blank_set]
+            if not segmento_limpio:
+                continue
             pagares.append(
                 {
                     "indice": 0,
-                    "pagina_inicio": segmento[0],
-                    "pagina_fin": segmento[-1],
+                    "pagina_inicio": segmento_limpio[0],
+                    "pagina_fin": segmento_limpio[-1],
                     "codigo_operacion": None,
-                    "paginas": segmento,
-                    "n_hojas": len(segmento),
+                    "paginas": segmento_limpio,
+                    "n_hojas": len(segmento_limpio),
                 }
             )
 
@@ -427,9 +617,11 @@ def detectar_pagares_actual_por_barcode(
             pagare["indice"] = i
 
         pagares = _excluir_paginas_qr_de_pagares(pagares, paginas_qr)
+        if preprocess is not None:
+            pagares = _excluir_paginas_de_pagares(pagares, preprocess.blank_pages_original)
 
         modo = "+".join(dict.fromkeys(modo_partes))
-        return {
+        result = {
             "total_paginas": total_pages,
             "total_pagares": len(pagares),
             "pagares": pagares,
@@ -438,13 +630,22 @@ def detectar_pagares_actual_por_barcode(
             "marcadores_qr": marcadores_qr,
             "paginas_qr": paginas_qr,
         }
+        if preprocess is not None:
+            result.update(_preprocess_metadata_dict(preprocess))
+        return result
 
     result = _detectar_pagares_actual_por_barcode_core(
         pdf_path=pdf_path,
-        pdf_bytes=pdf_bytes,
+        pdf_bytes=pdf_bytes_work,
         dpi=dpi,
         solo_rangos=solo_rangos,
     )
+    result = _apply_preprocess_to_result(result, preprocess)
+    doc_orig = fitz.open(stream=original_pdf_bytes, filetype="pdf")
+    try:
+        result["total_paginas"] = len(doc_orig)
+    finally:
+        doc_orig.close()
     if separar_qr:
         result["marcadores_qr"] = []
         result["paginas_qr"] = []
