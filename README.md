@@ -45,7 +45,7 @@ Respuesta principal:
 
 Imprima la hoja e insértela **entre** documentos antes de escanear. PagareSplit excluye la página QR del contenido y genera un documento por tramo.
 
-**Rendimiento:** el escaneo QR usa tres vías en orden: (1) imagen embebida del QR en la hoja separadora (~15–25 ms), (2) recorte central (~5 ms/página), (3) tiers profundos solo en páginas que parecen marcadora. Las portadas de pagaré con mucho texto se **saltan** sin escanear. Un PDF que es **solo** la hoja QR devuelve `modo: capturesep_qr_solo_marcadores` al instante, sin pasar por barcode.
+**Rendimiento:** el escaneo QR prioriza el **recorte central** (~5 ms/pág): el separador CAPTURESEP va centrado. Si el centro devuelve un QR que no es CAPTURESEP (cédula, CNE, etc.), la página se descarta al instante. Los tiers profundos (página completa) solo corren en hojas que parecen marcadora. Las portadas de pagaré/acta con mucho texto se **saltan** sin escanear. Un PDF que es **solo** la hoja QR devuelve `modo: capturesep_qr_solo_marcadores` al instante, sin pasar por barcode.
 
 ## Arranque Local
 

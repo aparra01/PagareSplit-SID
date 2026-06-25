@@ -9,19 +9,23 @@ import fitz
 from PIL import Image
 
 CAPTURESEP_PREFIX = "CAPTURESEP"
+CAPTURESEP_VERSION_ID = 2
 
 # Páginas de pagaré suelen superar este umbral; no llevan QR marcadora CAPTURESEP.
 _MAX_TEXTO_PAGINA_SIN_QR = 480
 
 # Escaneo por niveles: la hoja separadora tiene el QR centrado (Formas / módulo Separadores).
-_QR_SCAN_TIERS: tuple[tuple[float, float], ...] = (
-    (1.25, 0.50),  # ~5 ms/pág: recorte central, suficiente para hojas marcadora
+_QR_CENTER_SCALE = 1.25
+_QR_CENTER_FRAC = 0.50
+# Tiers profundos solo si el centro no encontró nada y la página parece hoja marcadora.
+_QR_DEEP_SCAN_TIERS: tuple[tuple[float, float], ...] = (
     (1.75, 0.65),  # respaldo si el QR quedó más abajo por título largo
-    (2.00, 1.00),  # último recurso: página completa (solo hojas marcadora probables)
+    (2.00, 1.00),  # último recurso: página completa
 )
 
 
 def decode_capturesep_payload(raw: str) -> dict[str, Any] | None:
+    """Solo acepta payloads oficiales CAPTURESEP (alineado con separadorQrPayloadDecode.ts)."""
     text = (raw or "").strip()
     if not text:
         return None
@@ -30,22 +34,33 @@ def decode_capturesep_payload(raw: str) -> dict[str, Any] | None:
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
-            data = None
-        if isinstance(data, dict):
-            cliente = str(data.get("cliente") or data.get("c") or data.get("client") or "").strip()
-            separador = str(data.get("separador") or data.get("s") or data.get("separator") or "").strip()
+            return None
+        if not isinstance(data, dict):
+            return None
+        cliente = str(data.get("cliente") or data.get("c") or data.get("client") or "").strip()
+        if not cliente:
+            return None
+        try:
             version = int(data.get("v") or data.get("version") or 1)
-            sep_id_raw = data.get("separador_id") or data.get("sid") or data.get("separadorId")
-            payload: dict[str, Any] = {"cliente": cliente or "QR", "separador": separador, "version": version}
-            if sep_id_raw not in (None, ""):
-                try:
-                    sep_id = int(sep_id_raw)
-                    if sep_id > 0:
-                        payload["separador_id"] = sep_id
-                except (TypeError, ValueError):
-                    pass
-            if payload.get("separador_id") or payload["separador"]:
-                return payload
+        except (TypeError, ValueError):
+            version = 1
+        sep_id_raw = data.get("separador_id") or data.get("sid") or data.get("separadorId")
+        if sep_id_raw not in (None, ""):
+            try:
+                sep_id = int(sep_id_raw)
+            except (TypeError, ValueError):
+                sep_id = 0
+            if sep_id > 0:
+                return {
+                    "cliente": cliente,
+                    "separador": str(data.get("separador") or data.get("s") or data.get("separator") or "").strip(),
+                    "version": CAPTURESEP_VERSION_ID if version >= CAPTURESEP_VERSION_ID else version,
+                    "separador_id": sep_id,
+                }
+        separador = str(data.get("separador") or data.get("s") or data.get("separator") or "").strip()
+        if separador:
+            return {"cliente": cliente, "separador": separador, "version": version}
+        return None
 
     parts = [p.strip() for p in text.split("|")]
     if len(parts) >= 4 and parts[0].upper() == CAPTURESEP_PREFIX:
@@ -54,23 +69,25 @@ def decode_capturesep_payload(raw: str) -> dict[str, Any] | None:
         except ValueError:
             version = 1
         cliente = parts[2]
-        if version >= 2:
+        if not cliente:
+            return None
+        if version >= CAPTURESEP_VERSION_ID:
             try:
                 sep_id = int(parts[3])
             except ValueError:
-                sep_id = 0
-            if cliente and sep_id > 0:
-                return {"cliente": cliente, "separador": "", "version": version, "separador_id": sep_id}
-            return None
+                return None
+            if sep_id < 1:
+                return None
+            return {"cliente": cliente, "separador": "", "version": version, "separador_id": sep_id}
         separador = "|".join(parts[3:]).strip()
-        if cliente and separador:
+        if separador:
             return {"cliente": cliente, "separador": separador, "version": version}
         return None
 
     if len(parts) == 2 and parts[0] and parts[1]:
         return {"cliente": parts[0], "separador": parts[1], "version": 1}
 
-    return {"cliente": "QR", "separador": text[:180] or "QR", "version": 1}
+    return None
 
 
 def _limpiar_texto_qr(texto: str) -> str:
@@ -129,18 +146,31 @@ def _texto_pagina(page: fitz.Page) -> str:
 
 
 def _es_raw_capturesep(raw: str) -> bool:
-    text = (raw or "").strip()
-    if not text:
-        return False
-    if text.upper().startswith(CAPTURESEP_PREFIX):
-        return True
-    if text.startswith("{"):
-        return decode_capturesep_payload(text) is not None
-    return decode_capturesep_payload(text) is not None
+    return decode_capturesep_payload(raw) is not None
+
+
+def _clasificar_raw_qr(raw: str | None) -> str | None:
+    """'capturesep' | 'other' | None — other = QR legible que no es separador oficial."""
+    if not raw:
+        return None
+    return "capturesep" if _es_raw_capturesep(raw) else "other"
+
+
+def _tiene_imagen_cuadrada_tipo_qr(images: list[Any]) -> bool:
+    """Imagen embebida cuadrada grande (típica de hoja separadora impresa o digital)."""
+    for img in images:
+        width = int(img[2] or 0)
+        height = int(img[3] or 0)
+        if width < 80 or height < 80:
+            continue
+        ratio = width / max(height, 1)
+        if 0.75 <= ratio <= 1.33 and min(width, height) >= 180:
+            return True
+    return False
 
 
 def _parece_hoja_marcadora_qr(page: fitz.Page, text: str | None = None) -> bool:
-    """Heurística para no gastar tiers costosos en portadas de pagaré con logos."""
+    """Heurística para tiers profundos: hoja separadora, no acta/cédula escaneada."""
     text = text if text is not None else _texto_pagina(page)
     text_len = len(text)
     if text_len >= _MAX_TEXTO_PAGINA_SIN_QR:
@@ -151,16 +181,13 @@ def _parece_hoja_marcadora_qr(page: fitz.Page, text: str | None = None) -> bool:
     images = page.get_images(full=True)
     if not images:
         return 0 < text_len < 220
+    if _tiene_imagen_cuadrada_tipo_qr(images):
+        return True
+    # Escaneo sin OCR (actas): muchas imágenes pero QR interno no está centrado como marcadora.
+    if text_len == 0:
+        return False
     if text_len <= 120:
         return True
-    for img in images:
-        width = int(img[2] or 0)
-        height = int(img[3] or 0)
-        if width < 80 or height < 80:
-            continue
-        ratio = width / max(height, 1)
-        if 0.75 <= ratio <= 1.33 and min(width, height) >= 180:
-            return True
     return text_len < 180
 
 
@@ -207,13 +234,47 @@ def _qr_desde_imagenes_embebidas(doc: fitz.Document, page: fitz.Page) -> str | N
                 try_downscale=try_downscale,
                 try_invert=try_invert,
             )
-            if raw and _es_raw_capturesep(raw):
-                return _limpiar_texto_qr(raw)
+            kind = _clasificar_raw_qr(raw)
+            if kind == "capturesep":
+                return _limpiar_texto_qr(raw)  # type: ignore[arg-type]
+            if kind == "other":
+                return None
     return None
 
 
+def _escaneo_qr_render(
+    page: fitz.Page,
+    scale: float,
+    center_frac: float,
+    *,
+    try_rotate: bool = False,
+    try_downscale: bool = False,
+    try_invert: bool = False,
+) -> tuple[str | None, str | None]:
+    """Renderiza región y clasifica QR. Retorna (raw_capturesep, 'other'|None)."""
+    try:
+        image = _render_pagina_rgb(page, scale)
+        if center_frac < 1.0:
+            image = _recorte_central(image, center_frac)
+    except Exception:
+        return None, None
+
+    raw = _leer_qr_zxing(
+        image,
+        try_rotate=try_rotate,
+        try_downscale=try_downscale,
+        try_invert=try_invert,
+    )
+    kind = _clasificar_raw_qr(raw)
+    if kind == "capturesep":
+        return _limpiar_texto_qr(raw), None  # type: ignore[arg-type]
+    if kind == "other":
+        return None, "other"
+    return None, None
+
+
 def _detectar_qr_en_pagina(page: fitz.Page, doc: fitz.Document | None = None) -> str | None:
-    """Busca CAPTURESEP: imagen embebida → recorte central → tiers profundos solo en marcadora."""
+    """Busca CAPTURESEP: embebida → centro (rápido) → tiers profundos solo en marcadora."""
     text = _texto_pagina(page)
     if len(text) >= _MAX_TEXTO_PAGINA_SIN_QR:
         return None
@@ -225,24 +286,33 @@ def _detectar_qr_en_pagina(page: fitz.Page, doc: fitz.Document | None = None) ->
         if raw:
             return raw
 
-    for tier_idx, (scale, center_frac) in enumerate(_QR_SCAN_TIERS):
-        if tier_idx > 0 and not probable_marcadora:
-            break
-        try:
-            image = _render_pagina_rgb(page, scale)
-            if center_frac < 1.0:
-                image = _recorte_central(image, center_frac)
-        except Exception:
-            continue
+    # Paso 1: recorte central (~5 ms/pág). El separador CAPTURESEP va centrado.
+    raw_center, other_center = _escaneo_qr_render(
+        page,
+        _QR_CENTER_SCALE,
+        _QR_CENTER_FRAC,
+    )
+    if raw_center:
+        return raw_center
+    if other_center == "other":
+        return None
 
-        raw = _leer_qr_zxing(
-            image,
-            try_rotate=tier_idx >= 2,
-            try_downscale=tier_idx >= 1,
-            try_invert=tier_idx >= 1,
+    if not probable_marcadora:
+        return None
+
+    for tier_idx, (scale, center_frac) in enumerate(_QR_DEEP_SCAN_TIERS):
+        raw, other = _escaneo_qr_render(
+            page,
+            scale,
+            center_frac,
+            try_rotate=tier_idx >= 1,
+            try_downscale=True,
+            try_invert=True,
         )
-        if raw and _es_raw_capturesep(raw):
-            return _limpiar_texto_qr(raw)
+        if raw:
+            return raw
+        if other == "other":
+            return None
     return None
 
 
