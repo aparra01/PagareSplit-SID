@@ -2,6 +2,8 @@
 FROM python:3.12-windowsservercore-ltsc2022
 
 SHELL ["powershell", "-NoProfile", "-Command"]
+
+# VC++ 2015–2022 x64 (wheels nativos: OpenCV, PyMuPDF, etc.).
 RUN $ErrorActionPreference = 'Stop'; \
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
     $vc = Join-Path $env:TEMP 'vc_redist.x64.exe'; \
@@ -9,6 +11,12 @@ RUN $ErrorActionPreference = 'Stop'; \
     $p = Start-Process -FilePath $vc -ArgumentList '/install','/quiet','/norestart' -Wait -PassThru; \
     if ($p.ExitCode -notin 0,3010,1638) { throw "vc_redist exit $($p.ExitCode)" }; \
     Remove-Item $vc -Force -ErrorAction SilentlyContinue
+
+# VC++ 2013 x64 — runtime que exigen binarios OpenCV en servercore (OpenCV >=4.7 enlaza Media Foundation, ausente aqui).
+RUN $ErrorActionPreference = 'Stop'; Set-ExecutionPolicy Bypass -Scope Process -Force; \
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; \
+    Invoke-Expression ((New-Object Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1')); \
+    choco install vcredist2013 -y --no-progress
 
 WORKDIR C:\\app
 
@@ -19,9 +27,12 @@ COPY requirements.txt .
 RUN python -m pip install --no-cache-dir --upgrade pip; \
     $r = Get-Content requirements.txt; \
     $r = $r -replace 'numpy==2\.2\.6', 'numpy==1.26.4'; \
+    $r = $r -replace 'opencv-python-headless==4\.10\.0\.84', 'opencv-python-headless==4.6.0.66'; \
     $r | Set-Content requirements.windows.txt; \
     python -m pip install --no-cache-dir -r requirements.windows.txt; \
-    python -m pip install --no-cache-dir zxing-cpp
+    python -m pip install --no-cache-dir zxing-cpp; \
+    python -m pip uninstall -y opencv-python opencv-contrib-python opencv-python-headless; \
+    python -m pip install --no-cache-dir 'opencv-python-headless==4.6.0.66'
 
 COPY app ./app
 COPY main.py .
