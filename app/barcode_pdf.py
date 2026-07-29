@@ -96,7 +96,6 @@ def barcodes_pdf_en_memoria(
                     variant,
                     try_rotate=True,
                     try_downscale=True,
-                    try_invert=True,
                     return_errors=False,
                 ):
                     text = (getattr(barcode, "text", "") or "").strip()
