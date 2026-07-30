@@ -19,6 +19,8 @@ from app.capturesep_qr import (
 
 BARCODE_SCAN_DPI_FALLBACKS = (160, 200)
 LAYOUT_START_SIM_THRESHOLD = 0.45
+LAYOUT_START_SIM_THRESHOLD_RELAXED = 0.35
+LAYOUT_START_MIN_GAP = 2
 
 
 def _starts_con_prefijo_huerfano(starts: list[tuple[int, str | None]]) -> list[tuple[int, str | None]]:
@@ -128,6 +130,76 @@ def _paginas_inicio_por_layout(
     return starts, scores
 
 
+def _similitud_por_pagina(layout_scores: list[dict[str, Any]]) -> dict[int, float]:
+    return {int(item["page"]): float(item["similarity"]) for item in layout_scores}
+
+
+def _layout_starts_desde_scores(
+    layout_scores: list[dict[str, Any]],
+    threshold: float,
+    *,
+    min_gap: int = LAYOUT_START_MIN_GAP,
+) -> list[int]:
+    starts = [1]
+    for item in layout_scores:
+        idx = int(item["page"])
+        if idx == 1:
+            continue
+        if float(item["similarity"]) >= threshold and idx - starts[-1] >= min_gap:
+            starts.append(idx)
+    return starts
+
+
+def _codigo_operacion_para_inicio(
+    page: int,
+    codigo_por_pagina: dict[int, str],
+    *,
+    total_pages: int,
+    ventana: int = 2,
+) -> str | None:
+    directo = codigo_por_pagina.get(page)
+    if directo:
+        return directo
+    for offset in range(1, ventana + 1):
+        for candidata in (page + offset, page - offset):
+            if 1 <= candidata <= total_pages:
+                codigo = codigo_por_pagina.get(candidata)
+                if codigo:
+                    return codigo
+    return None
+
+
+def _corte_barcode_sospechoso(
+    starts: list[tuple[int, str | None]],
+    layout_scores: list[dict[str, Any]],
+) -> bool:
+    if len(starts) < 2 or not layout_scores:
+        return False
+    sim = _similitud_por_pagina(layout_scores)
+    page2 = starts[1][0]
+    # Barcode distinto muy pronto en una hoja que no parece portada (p. ej. desembolso).
+    return page2 <= 5 and sim.get(page2, 0.0) < LAYOUT_START_SIM_THRESHOLD_RELAXED
+
+
+def _refinar_starts_barcode_con_layout(
+    starts: list[tuple[int, str | None]],
+    layout_scores: list[dict[str, Any]],
+    codigo_por_pagina: dict[int, str],
+    *,
+    total_pages: int,
+) -> tuple[list[tuple[int, str | None]], bool]:
+    if not _corte_barcode_sospechoso(starts, layout_scores):
+        return starts, False
+    relaxed = _layout_starts_desde_scores(layout_scores, LAYOUT_START_SIM_THRESHOLD_RELAXED)
+    if len(relaxed) < 2:
+        return starts, False
+    refinados = [
+        (page, _codigo_operacion_para_inicio(page, codigo_por_pagina, total_pages=total_pages))
+        for page in relaxed
+    ]
+    return refinados, True
+
+
 def _codigo_por_pagina_desde_barcodes(por_pagina: list[list[dict[str, Any]]]) -> dict[int, str]:
     out: dict[int, str] = {}
     for page_idx, barcodes in enumerate(por_pagina, start=1):
@@ -167,6 +239,90 @@ def _extraer_paginas_pdf(pdf_bytes: bytes, pages_1based: list[int]) -> bytes:
     finally:
         src.close()
         dst.close()
+
+
+def _pagare_dict(
+    *,
+    start: int,
+    end: int,
+    codigo_operacion: str | None,
+    paginas: list[int],
+) -> dict[str, Any]:
+    return {
+        "pagina_inicio": start,
+        "pagina_fin": end,
+        "codigo_operacion": codigo_operacion,
+        "paginas": paginas,
+        "n_hojas": len(paginas),
+    }
+
+
+def _partir_pagares_por_reaparicion_codigo(
+    pagares: list[dict[str, Any]],
+    codigo_por_pagina: dict[int, str],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Corta un bloque cuando reaparece el barcode de una operación ya segmentada."""
+    if not pagares:
+        return pagares, False
+
+    resultado: list[dict[str, Any]] = []
+    recortado = False
+
+    for item in pagares:
+        start = int(item["pagina_inicio"])
+        end = int(item["pagina_fin"])
+        codigo_actual = str(item.get("codigo_operacion") or "").strip() or None
+        codigos_previos = {
+            str(p.get("codigo_operacion") or "").strip()
+            for p in resultado
+            if str(p.get("codigo_operacion") or "").strip()
+        }
+
+        corte: int | None = None
+        codigo_corte: str | None = None
+        for page in range(start, end + 1):
+            code_page = codigo_por_pagina.get(page)
+            if code_page and code_page in codigos_previos:
+                corte = page
+                codigo_corte = code_page
+                break
+
+        if corte is None:
+            paginas = list(range(start, end + 1))
+            codigo_bloque = codigo_actual
+            if not codigo_bloque:
+                for page in paginas:
+                    if codigo_por_pagina.get(page):
+                        codigo_bloque = codigo_por_pagina[page]
+                        break
+            resultado.append(_pagare_dict(start=start, end=end, codigo_operacion=codigo_bloque, paginas=paginas))
+            continue
+
+        if corte > start:
+            paginas = list(range(start, corte))
+            codigo_bloque = codigo_actual
+            if not codigo_bloque:
+                for page in paginas:
+                    if codigo_por_pagina.get(page):
+                        codigo_bloque = codigo_por_pagina[page]
+                        break
+            resultado.append(_pagare_dict(start=start, end=corte - 1, codigo_operacion=codigo_bloque, paginas=paginas))
+            recortado = True
+
+        paginas_cola = list(range(corte, end + 1))
+        resultado.append(
+            _pagare_dict(
+                start=corte,
+                end=end,
+                codigo_operacion=codigo_corte or codigo_por_pagina.get(corte),
+                paginas=paginas_cola,
+            )
+        )
+        recortado = True
+
+    for idx, pagare in enumerate(resultado, start=1):
+        pagare["indice"] = idx
+    return resultado, recortado
 
 
 def _remapear_pagares_a_original(pagares: list[dict[str, Any]], pages_1based: list[int]) -> list[dict[str, Any]]:
@@ -229,6 +385,7 @@ def _detectar_pagares_actual_por_barcode_core(
     total_pages = len(layout_scores)
     dpis_usados = [dpi_inicial]
     uso_layout = len(layout_starts) >= 2
+    refinado_layout = False
 
     if uso_layout:
         paginas_barcode = {
@@ -284,6 +441,14 @@ def _detectar_pagares_actual_por_barcode_core(
                 if len(starts) > 1:
                     break
         codigo_por_pagina = _codigo_por_pagina_desde_barcodes(por_pagina)
+        starts, refinado_layout = _refinar_starts_barcode_con_layout(
+            starts,
+            layout_scores,
+            codigo_por_pagina,
+            total_pages=total_pages,
+        )
+        if refinado_layout:
+            uso_layout = True
 
     starts = _starts_con_prefijo_huerfano(starts)
 
@@ -299,25 +464,36 @@ def _detectar_pagares_actual_por_barcode_core(
                     codigo_operacion = codigo_por_pagina[p]
                     break
         pagares.append(
-            {
-                "indice": i + 1,
-                "pagina_inicio": start,
-                "pagina_fin": end,
-                "codigo_operacion": codigo_operacion,
-                "paginas": paginas,
-                "n_hojas": len(paginas),
-            }
+            _pagare_dict(
+                start=start,
+                end=end,
+                codigo_operacion=codigo_operacion,
+                paginas=paginas,
+            )
         )
 
-    return {
+    pagares, recortado_reaparicion = _partir_pagares_por_reaparicion_codigo(pagares, codigo_por_pagina)
+    modo_base = (
+        "layout_portada_rapido"
+        if uso_layout and solo_rangos
+        else (
+            "layout_unico_rapido"
+            if solo_rangos
+            else (
+                "layout_refinado_barcode_code39"
+                if refinado_layout
+                else ("layout_portada_barcode_code39" if uso_layout else "barcode_code39")
+            )
+        )
+    )
+    if recortado_reaparicion:
+        modo_base = f"{modo_base}+recorte_reaparicion"
+
+    result = {
         "total_paginas": total_pages,
         "total_pagares": len(pagares),
         "pagares": pagares,
-        "modo": (
-            "layout_portada_rapido"
-            if uso_layout and solo_rangos
-            else ("layout_unico_rapido" if solo_rangos else ("layout_portada_barcode_code39" if uso_layout else "barcode_code39"))
-        ),
+        "modo": modo_base,
         "dpi_usado": max(dpis_usados) if dpis_usados else dpi_inicial,
         "layout_por_pagina": layout_scores,
         "barcodes_por_pagina": [
@@ -329,6 +505,7 @@ def _detectar_pagares_actual_por_barcode_core(
             for idx, items in enumerate(por_pagina, start=1)
         ],
     }
+    return result
 
 
 def detectar_pagares_actual_por_barcode(
