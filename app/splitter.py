@@ -21,6 +21,12 @@ BARCODE_SCAN_DPI_FALLBACKS = (160, 200)
 LAYOUT_START_SIM_THRESHOLD = 0.45
 
 
+def _starts_con_prefijo_huerfano(starts: list[tuple[int, str | None]]) -> list[tuple[int, str | None]]:
+    if starts and starts[0][0] > 1:
+        return [(1, None), *starts]
+    return starts
+
+
 def _digits(text: str) -> str:
     return re.sub(r"\D+", "", text or "")
 
@@ -278,6 +284,8 @@ def _detectar_pagares_actual_por_barcode_core(
                 if len(starts) > 1:
                     break
         codigo_por_pagina = _codigo_por_pagina_desde_barcodes(por_pagina)
+
+    starts = _starts_con_prefijo_huerfano(starts)
 
     pagares: list[dict[str, Any]] = []
     for i, (start, code) in enumerate(starts):
