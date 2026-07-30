@@ -10,6 +10,7 @@ Microservicio dedicado para separar lotes PDF de pagarés sin ejecutar OCR ni mo
 
 - `GET /health`
 - `POST /detectar-pagares-actual`
+- `POST /validar-orden-sucursales` — **flujo sucursales (DocNative):** detecta PDF con operaciones intercaladas sin generar rangos de corte.
 
 `POST /detectar-pagares-actual` recibe multipart:
 

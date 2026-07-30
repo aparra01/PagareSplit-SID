@@ -508,6 +508,116 @@ def _detectar_pagares_actual_por_barcode_core(
     return result
 
 
+def _forward_fill_codigo_por_pagina(codigo_por_pagina: dict[int, str], total_pages: int) -> dict[int, str]:
+    filled = dict(codigo_por_pagina)
+    last_code: str | None = None
+    for page in range(1, total_pages + 1):
+        code = filled.get(page)
+        if code:
+            last_code = code
+            continue
+        if last_code:
+            filled[page] = last_code
+    return filled
+
+
+def _bloques_no_contiguos(pages: list[int]) -> bool:
+    if len(pages) <= 1:
+        return False
+    for i in range(1, len(pages)):
+        if pages[i] != pages[i - 1] + 1:
+            return True
+    return False
+
+
+def _detectar_pdf_intercalado(codigo_por_pagina: dict[int, str], total_pages: int) -> tuple[bool, dict[str, list[int]]]:
+    if total_pages <= 0 or len(codigo_por_pagina) < 2:
+        return False, {}
+
+    filled = _forward_fill_codigo_por_pagina(codigo_por_pagina, total_pages)
+    pages_by_code: dict[str, list[int]] = {}
+    for page, code in sorted(filled.items()):
+        pages_by_code.setdefault(code, []).append(page)
+
+    if len(pages_by_code) < 2:
+        return False, pages_by_code
+
+    for pages in pages_by_code.values():
+        if _bloques_no_contiguos(pages):
+            return True, pages_by_code
+
+    previous: str | None = None
+    seen_since_change: set[str] = set()
+    for page in range(1, total_pages + 1):
+        code = filled.get(page)
+        if not code:
+            continue
+        if previous and code != previous and code in seen_since_change:
+            return True, pages_by_code
+        if previous and code != previous:
+            seen_since_change.add(previous)
+        previous = code
+
+    return False, pages_by_code
+
+
+def _mensaje_pdf_intercalado(pages_by_code: dict[str, list[int]]) -> str:
+    parts: list[str] = []
+    for code, pages in sorted(pages_by_code.items(), key=lambda item: item[1][0]):
+        if not pages:
+            continue
+        ranges: list[str] = []
+        start = pages[0]
+        end = pages[0]
+        for page in pages[1:]:
+            if page == end + 1:
+                end = page
+                continue
+            ranges.append(str(start) if start == end else f"{start}-{end}")
+            start = page
+            end = page
+        ranges.append(str(start) if start == end else f"{start}-{end}")
+        parts.append(f"{code}: pág. {','.join(ranges)}")
+    detail = "; ".join(parts)
+    return f"PDF mal ordenado: operaciones intercaladas ({detail}). Re-escanee separando cada pagaré."
+
+
+def validar_orden_pdf_sucursales(
+    *,
+    pdf_path: Path | None = None,
+    pdf_bytes: bytes | None = None,
+    dpi: int = 160,
+) -> dict[str, Any]:
+    """Valida orden de operaciones para flujo sucursales (DocNative)."""
+    dpi_inicial = max(72, min(int(dpi or 160), 300))
+    por_pagina = barcodes_pdf_en_memoria(pdf_path=pdf_path, pdf_bytes=pdf_bytes, dpi=dpi_inicial)
+    total_pages = len(por_pagina)
+    codigo_por_pagina = _codigo_por_pagina_desde_barcodes(por_pagina)
+
+    if total_pages > 1 and len(codigo_por_pagina) < 2:
+        for dpi_retry in BARCODE_SCAN_DPI_FALLBACKS:
+            if dpi_retry <= dpi_inicial:
+                continue
+            extra = barcodes_pdf_en_memoria(
+                pdf_path=pdf_path,
+                pdf_bytes=pdf_bytes,
+                dpi=dpi_retry,
+            )
+            por_pagina = _merge_barcodes_por_pagina(por_pagina, extra)
+            codigo_por_pagina = _codigo_por_pagina_desde_barcodes(por_pagina)
+            if len(codigo_por_pagina) >= 2:
+                break
+
+    intercalado, pages_by_code = _detectar_pdf_intercalado(codigo_por_pagina, total_pages)
+    return {
+        "total_paginas": total_pages,
+        "intercalado": intercalado,
+        "codigos_detectados": sorted(pages_by_code.keys()),
+        "paginas_por_codigo": pages_by_code,
+        "mensaje": _mensaje_pdf_intercalado(pages_by_code) if intercalado else None,
+    }
+
+
 def detectar_pagares_actual_por_barcode(
     *,
     pdf_path: Path | None = None,
