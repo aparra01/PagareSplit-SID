@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     reload: bool = False
     max_pdf_mb: int = 150
     default_dpi: int = 160
+    validation_max_concurrent: int = 1
+    workers: int = 1
 
     model_config = SettingsConfigDict(
         env_prefix="PAGARE_SPLIT_",

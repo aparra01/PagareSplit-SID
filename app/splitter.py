@@ -595,6 +595,16 @@ def validar_orden_pdf_sucursales(
     codigo_por_pagina = _codigo_por_pagina_desde_barcodes(por_pagina)
 
     if total_pages > 1 and len(codigo_por_pagina) < 2:
+        if len(codigo_por_pagina) == 0:
+            # Sin códigos no puede haber intercalado (requiere >=2 operaciones distintas).
+            return {
+                "total_paginas": total_pages,
+                "intercalado": False,
+                "codigos_detectados": [],
+                "paginas_por_codigo": {},
+                "mensaje": None,
+            }
+
         for dpi_retry in BARCODE_SCAN_DPI_FALLBACKS:
             if dpi_retry <= dpi_inicial:
                 continue
