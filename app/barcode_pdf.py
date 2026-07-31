@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import fitz
+import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+
+# zxing-cpp falla en imágenes full-page RGB muy grandes (~>45M px).
+_MAX_FULL_RAW_PIXELS = 45_000_000
 
 
 def _barcode_bbox(position: Any) -> list[float]:
@@ -56,6 +60,24 @@ def _barcode_variants(image: Image.Image) -> list[tuple[str, Image.Image]]:
     return variants
 
 
+def _read_barcodes_safe(variant: Image.Image) -> Iterable[Any]:
+    try:
+        import zxingcpp
+    except ImportError:
+        return []
+
+    source = np.asarray(variant)
+    try:
+        return zxingcpp.read_barcodes(
+            source,
+            try_rotate=True,
+            try_downscale=True,
+            return_errors=False,
+        )
+    except (TypeError, MemoryError, ValueError):
+        return []
+
+
 def barcodes_pdf_en_memoria(
     *,
     pdf_path: Path | None = None,
@@ -90,14 +112,12 @@ def barcodes_pdf_en_memoria(
             image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
             found: list[dict[str, Any]] = []
             seen_found: set[tuple[str, str]] = set()
+            page_pixels = image.size[0] * image.size[1]
 
             for region_name, variant in _barcode_variants(image):
-                for barcode in zxingcpp.read_barcodes(
-                    variant,
-                    try_rotate=True,
-                    try_downscale=True,
-                    return_errors=False,
-                ):
+                if region_name.startswith("full:raw") and page_pixels > _MAX_FULL_RAW_PIXELS:
+                    continue
+                for barcode in _read_barcodes_safe(variant):
                     text = (getattr(barcode, "text", "") or "").strip()
                     if not text:
                         continue
