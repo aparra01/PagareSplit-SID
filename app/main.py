@@ -10,6 +10,12 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from app.config import get_settings
 from app.splitter import detectar_pagares_actual_por_barcode, validar_orden_pdf_sucursales
 
+try:
+    from logging_config import configure_logging
+    configure_logging()
+except ImportError:
+    pass
+
 app = FastAPI(
     title="PagareSplit-SID",
     version="0.1.0",

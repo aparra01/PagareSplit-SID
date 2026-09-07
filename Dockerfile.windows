@@ -36,6 +36,8 @@ RUN python -m pip install --no-cache-dir --upgrade pip; \
 
 COPY app ./app
 COPY main.py .
+COPY logging_config.py .
+COPY sid_daily_file_handler.py .
 
 EXPOSE 8006
 CMD ["python", "main.py"]

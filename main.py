@@ -4,6 +4,12 @@ import uvicorn
 
 from app.config import get_settings
 
+try:
+    from logging_config import configure_logging
+    configure_logging()
+except ImportError:
+    pass
+
 
 if __name__ == "__main__":
     settings = get_settings()
