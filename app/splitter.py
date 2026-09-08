@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -652,6 +653,109 @@ def validar_orden_pdf_sucursales(
         "codigos_detectados": sorted(pages_by_code.keys()),
         "paginas_por_codigo": pages_by_code,
         "mensaje": _mensaje_pdf_intercalado(pages_by_code) if intercalado else None,
+    }
+
+
+def _scan_codigo_por_pagina_raw(
+    *,
+    pdf_path: Path | None = None,
+    pdf_bytes: bytes | None = None,
+    dpi: int = 160,
+) -> tuple[int, dict[int, str]]:
+    """Escanea barcodes por página (solo lecturas directas, sin forward-fill)."""
+    dpi_inicial = max(72, min(int(dpi or 160), 300))
+    por_pagina = barcodes_pdf_en_memoria(pdf_path=pdf_path, pdf_bytes=pdf_bytes, dpi=dpi_inicial)
+    total_pages = len(por_pagina)
+    codigo_por_pagina = _codigo_por_pagina_desde_barcodes(por_pagina)
+
+    if total_pages > 1 and len(codigo_por_pagina) < 2:
+        for dpi_retry in BARCODE_SCAN_DPI_FALLBACKS:
+            if dpi_retry <= dpi_inicial:
+                continue
+            extra = barcodes_pdf_en_memoria(
+                pdf_path=pdf_path,
+                pdf_bytes=pdf_bytes,
+                dpi=dpi_retry,
+            )
+            por_pagina = _merge_barcodes_por_pagina(por_pagina, extra)
+            codigo_por_pagina = _codigo_por_pagina_desde_barcodes(por_pagina)
+
+    return total_pages, codigo_por_pagina
+
+
+def _primera_pagina_excedente(
+    codigo_por_pagina_raw: dict[int, str],
+    codigo: str,
+    max_permitido: int,
+) -> int | None:
+    count = 0
+    for page in sorted(codigo_por_pagina_raw.keys()):
+        if codigo_por_pagina_raw.get(page) != codigo:
+            continue
+        count += 1
+        if count > max_permitido:
+            return page
+    return None
+
+
+def validar_pagare_pdf_sucursales(
+    *,
+    pdf_path: Path | None = None,
+    pdf_bytes: bytes | None = None,
+    dpi: int = 160,
+    validar_un_barcode: bool = True,
+    validar_repeticiones_barcode: bool = False,
+    max_repeticiones_barcode: int = 2,
+) -> dict[str, Any]:
+    """Valida un pagaré por PDF (DocNative): códigos distintos y repeticiones opcionales."""
+    total_pages, codigo_por_pagina_raw = _scan_codigo_por_pagina_raw(
+        pdf_path=pdf_path,
+        pdf_bytes=pdf_bytes,
+        dpi=dpi,
+    )
+
+    codigo_por_pagina_completo = _forward_fill_codigo_por_pagina(codigo_por_pagina_raw, total_pages)
+    codigos_distintos = sorted({code for code in codigo_por_pagina_completo.values() if code})
+
+    if validar_un_barcode and len(codigos_distintos) > 1:
+        return {
+            "valido": False,
+            "codigo": "MULTIPLES_PAGARES",
+            "mensaje": (
+                "Se detectaron múltiples pagarés en un mismo PDF. "
+                "Por favor, digitalice un pagaré a la vez."
+            ),
+            "total_paginas": total_pages,
+            "codigos_detectados": codigos_distintos,
+        }
+
+    if validar_repeticiones_barcode:
+        max_rep = max(1, int(max_repeticiones_barcode or 2))
+        conteo = Counter(code for code in codigo_por_pagina_raw.values() if code)
+        for codigo, veces in conteo.items():
+            if veces <= max_rep:
+                continue
+            primera = _primera_pagina_excedente(codigo_por_pagina_raw, codigo, max_rep)
+            return {
+                "valido": False,
+                "codigo": "BARCODE_REPETIDO_EXCESO",
+                "mensaje": (
+                    "El pagaré parece estar duplicado dentro del mismo PDF "
+                    "(el código se repite más veces de lo esperado). "
+                    "Por favor, digitalice un pagaré a la vez."
+                ),
+                "codigo_operacion": codigo,
+                "veces_detectado": veces,
+                "max_permitido": max_rep,
+                "primera_pagina_excedente": primera,
+                "total_paginas": total_pages,
+                "codigos_detectados": codigos_distintos,
+            }
+
+    return {
+        "valido": True,
+        "total_paginas": total_pages,
+        "codigos_detectados": codigos_distintos,
     }
 
 

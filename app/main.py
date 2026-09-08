@@ -8,7 +8,11 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
 from app.config import get_settings
-from app.splitter import detectar_pagares_actual_por_barcode, validar_orden_pdf_sucursales
+from app.splitter import (
+    detectar_pagares_actual_por_barcode,
+    validar_orden_pdf_sucursales,
+    validar_pagare_pdf_sucursales,
+)
 
 try:
     from logging_config import configure_logging
@@ -132,4 +136,37 @@ async def validar_orden_sucursales(
             validar_orden_pdf_sucursales,
             pdf_bytes=pdf_bytes,
             dpi=safe_dpi,
+        )
+
+
+@app.post("/validar-pagare-sucursales")
+async def validar_pagare_sucursales(
+    file: UploadFile = File(...),
+    dpi: int = Form(default=160),
+    validar_un_barcode: bool = Form(default=True),
+    validar_repeticiones_barcode: bool = Form(default=False),
+    max_repeticiones_barcode: int = Form(default=2),
+):
+    """Flujo sucursales (DocNative): valida un pagaré por PDF vía barcode Code39."""
+    settings = get_settings()
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Sube un archivo .pdf")
+
+    pdf_bytes = await file.read()
+    if len(pdf_bytes) == 0:
+        raise HTTPException(400, "PDF vacío")
+
+    max_bytes = max(1, settings.max_pdf_mb) * 1024 * 1024
+    if len(pdf_bytes) > max_bytes:
+        raise HTTPException(413, f"PDF demasiado grande para validación ({settings.max_pdf_mb} MB máximo)")
+
+    safe_dpi = max(72, min(int(dpi or settings.default_dpi), 300))
+    async with _validation_semaphore:
+        return await asyncio.to_thread(
+            validar_pagare_pdf_sucursales,
+            pdf_bytes=pdf_bytes,
+            dpi=safe_dpi,
+            validar_un_barcode=validar_un_barcode,
+            validar_repeticiones_barcode=validar_repeticiones_barcode,
+            max_repeticiones_barcode=max_repeticiones_barcode,
         )
