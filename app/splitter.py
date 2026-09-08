@@ -29,6 +29,29 @@ def _starts_con_prefijo_huerfano(starts: list[tuple[int, str | None]]) -> list[t
     return starts
 
 
+def _filtrar_starts_con_barcode_obligatorio(
+    starts: list[tuple[int, str | None]],
+    *,
+    solo_rangos: bool,
+) -> list[tuple[int, str | None]]:
+    if solo_rangos:
+        return starts
+    return [(page, code) for page, code in starts if code]
+
+
+def _filtrar_pagares_con_barcode_obligatorio(
+    pagares: list[dict[str, Any]],
+    *,
+    solo_rangos: bool,
+) -> list[dict[str, Any]]:
+    if solo_rangos:
+        return pagares
+    filtered = [p for p in pagares if str(p.get("codigo_operacion") or "").strip()]
+    for i, pagare in enumerate(filtered, start=1):
+        pagare["indice"] = i
+    return filtered
+
+
 def _digits(text: str) -> str:
     return re.sub(r"\D+", "", text or "")
 
@@ -450,7 +473,10 @@ def _detectar_pagares_actual_por_barcode_core(
         if refinado_layout:
             uso_layout = True
 
-    starts = _starts_con_prefijo_huerfano(starts)
+    if solo_rangos:
+        starts = _starts_con_prefijo_huerfano(starts)
+    else:
+        starts = _filtrar_starts_con_barcode_obligatorio(starts, solo_rangos=False)
 
     pagares: list[dict[str, Any]] = []
     for i, (start, code) in enumerate(starts):
@@ -458,7 +484,7 @@ def _detectar_pagares_actual_por_barcode_core(
         end = max(start, next_start - 1)
         paginas = list(range(start, end + 1))
         codigo_operacion = code
-        if not codigo_operacion:
+        if not codigo_operacion and solo_rangos:
             for p in paginas:
                 if codigo_por_pagina.get(p):
                     codigo_operacion = codigo_por_pagina[p]
@@ -473,6 +499,7 @@ def _detectar_pagares_actual_por_barcode_core(
         )
 
     pagares, recortado_reaparicion = _partir_pagares_por_reaparicion_codigo(pagares, codigo_por_pagina)
+    pagares = _filtrar_pagares_con_barcode_obligatorio(pagares, solo_rangos=solo_rangos)
     modo_base = (
         "layout_portada_rapido"
         if uso_layout and solo_rangos
@@ -657,7 +684,7 @@ def detectar_pagares_actual_por_barcode(
         doc.close()
         paginas = list(range(1, total_pages + 1)) if total_pages > 0 else []
         pagares = []
-        if paginas:
+        if paginas and solo_rangos:
             pagares = [
                 {
                     "indice": 1,
@@ -717,6 +744,9 @@ def detectar_pagares_actual_por_barcode(
                         modo_partes.append(str(sub["modo"]))
                     continue
 
+            if not solo_rangos:
+                continue
+
             pagares.append(
                 {
                     "indice": 0,
@@ -732,6 +762,7 @@ def detectar_pagares_actual_por_barcode(
             pagare["indice"] = i
 
         pagares = _excluir_paginas_qr_de_pagares(pagares, paginas_qr)
+        pagares = _filtrar_pagares_con_barcode_obligatorio(pagares, solo_rangos=solo_rangos)
 
         modo = "+".join(dict.fromkeys(modo_partes))
         return {
