@@ -46,7 +46,9 @@ def _rangos(result: dict) -> list[tuple[int, int, str]]:
         ("ordenado", {1: OP_A, 3: OP_A}, [(1, 5, OP_A)]),
         # Desordenado: desembolso primero (pág. 1) y pagaré después (pág. 4).
         ("desordenado", {1: OP_A, 4: OP_A}, [(1, 5, OP_A)]),
-        # Solo se leyó uno de los dos barcodes.
+        # Solo se leyó uno de los dos barcodes: el split arranca en pág. 3.
+        # PyVision (agencias, 1 pagaré por PDF) amplía el rango a 1-5
+        # en PagareOcrHandler._pagare_unico_documento_completo.
         ("un_solo_barcode_leido", {3: OP_A}, [(3, 5, OP_A)]),
     ],
 )
@@ -55,7 +57,14 @@ def test_un_pagare_con_dos_barcodes_iguales_no_se_parte(caso, raw, esperado):
     assert _rangos(result) == esperado, caso
 
 
-def test_lote_dos_pagares_uno_desordenado():
-    # A ordenado (1-5, barcodes 1 y 3) + B desordenado (6-10: desembolso en 6, pagaré en 9).
-    result = _detectar(10, {1: OP_A, 3: OP_A, 6: OP_B, 9: OP_B})
-    assert _rangos(result) == [(1, 5, OP_A), (6, 10, OP_B)]
+def test_pagare_grande_varias_hojas_es_uno_solo():
+    # Crédito grande: 12 hojas, barcode en el pagaré (pág. 1) y en el desembolso (pág. 10).
+    result = _detectar(12, {1: OP_A, 10: OP_A})
+    assert _rangos(result) == [(1, 12, OP_A)]
+
+
+def test_codigos_distintos_se_reportan_para_que_pyvision_rechace():
+    # Agencias es un pagaré por PDF: dos códigos distintos -> PyVision lo rechaza (multi_pagare).
+    result = _detectar(10, {1: OP_A, 6: OP_B})
+    assert len(result["pagares"]) == 2
+    assert {p["codigo_operacion"] for p in result["pagares"]} == {OP_A, OP_B}
